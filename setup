@@ -1,0 +1,191 @@
+#!/bin/sh
+set -e
+
+# Echo stdin or the first argument without blocking
+readin() { dd iflag=nonblock 2>/dev/null || echo "$1"; }
+# Format heredoc for embedding in JSON
+escape() { readin "$1" | tr '\n' ' ' | sed -re 's/ +/ /g;s/(\\|")/\\\1/g'; }
+# Drop az output
+silent() { echo "--only-show-errors --output none"; }
+# Format az output to select specific parameters
+query()  { local IFS=,; echo "--only-show-errors --output tsv --query [$*]"; }
+# Get particular parameters from a multi-value response
+getval() { echo "$2" | sed -n $1p; }
+
+# Parse arguments into env; arguments can be in short form (-a), long form
+# (--application), or as an env variable (APPLICATION)
+ARGS=$(getopt -o 'a:c:d:g:s:t:' \
+    -l 'application:,cluster:,database:,resource-group:,subscription:,table:' \
+    -- "$@")
+eval set -- "$ARGS"
+while true; do
+    case "$1" in
+        -a|--application) APPLICATION=$2; shift 2;;
+        -c|--cluster) CLUSTER=$2; shift 2;;
+        -d|--database) DATABASE=$2; shift 2;;
+        -g|--resource-group) RESOURCE_GROUP=$2; shift 2;;
+        -s|--subscription) SUBSCRIPTION=$2; shift 2;;
+        -t|--table) TABLE=$2; shift 2;;
+        --) shift; break;;
+    esac
+done
+
+# Validate required arguments
+if [ -z "$APPLICATION" ] || [ -z "$CLUSTER" ] || [ -z "$DATABASE" ]; then
+    echo "Application (-a), cluster (-c), and database (-d) are required."
+    exit 1
+fi
+
+# Ensure required extensions
+az extension add -n kusto $(silent)
+
+# Default arguments
+[ -z "$TABLE" ] && TABLE=Telemetry
+[ -z "$RESOURCE_GROUP" ] && RESOURCE_GROUP=$(az config get $(query value) \
+    --local defaults.group 2>/dev/null || true)
+[ -z "$SUBSCRIPTION" ] && SUBSCRIPTION=$(az account show $(query id) \
+    2>/dev/null || true)
+
+# Verify the existence of the application, and default to its resource group
+APPLICATION_DATA=$(az iot central app show --name "$APPLICATION" \
+    --subscription "$SUBSCRIPTION" $(query subdomain resourceGroup location))
+APPLICATION_SUBDOMAIN=$(getval 1 "$APPLICATION_DATA")
+APPLICATION_RESOURCE_GROUP=$(getval 2 "$APPLICATION_DATA")
+APPLICATION_LOCATION=$(getval 3 "$APPLICATION_DATA")
+APPLICATION_URL="https://$APPLICATION_SUBDOMAIN.azureiotcentral.com"
+[ -z "$RESOURCE_GROUP" ] && RESOURCE_GROUP="$APPLICATION_RESOURCE_GROUP"
+
+# Retrieve the ADX resources or create them if needed
+RESOURCE_ARGS="--subscription $SUBSCRIPTION --resource-group $RESOURCE_GROUP"
+CLUSTER_ARGS="$RESOURCE_ARGS --cluster-name $CLUSTER"
+DATABASE_ARGS="$CLUSTER_ARGS --database-name $DATABASE"
+if ! CLUSTER_DATA=$(az kusto cluster show $(query uri location) $CLUSTER_ARGS \
+    2>/dev/null); then
+    echo "Creating ADX cluster \"$CLUSTER\"..."
+    CLUSTER_DATA=$(az kusto cluster create $(query uri location) $CLUSTER_ARGS \
+        --sku name=Standard_E16a_v4 tier=Standard --enable-streaming-ingest \
+        --type None --location "$APPLICATION_LOCATION")
+fi
+CLUSTER_URL=$(getval 1 "$CLUSTER_DATA")
+CLUSTER_LOCATION=$(getval 2 "$CLUSTER_DATA")
+if ! az kusto database show $(silent) $DATABASE_ARGS 2>/dev/null; then
+    echo "Creating ADX database \"$DATABASE\"..."
+    az kusto database create $(silent) $DATABASE_ARGS \
+        --read-write-database "location=$CLUSTER_LOCATION"
+fi
+
+# Set up common commands (body read from stdin)
+kusto() {
+    az rest $(silent) --resource "$CLUSTER_URL" \
+        -m post -u "$CLUSTER_URL/v1/rest/mgmt" \
+        -b "{\"db\":\"$DATABASE\",\"csl\":\"$(escape "$1")\"}"
+}
+iotc() {
+    az rest $(silent) --resource "https://apps.azureiotcentral.com" \
+        -m $1 -u "$APPLICATION_URL/api/$2?api-version=1.1-preview" \
+        -b "$(readin "$3")"
+}
+
+# Generate a common unique name
+NAME=$(echo "${CLUSTER}-${DATABASE}-${TABLE}" | tr '[:upper:]' '[:lower:]')
+
+# Clean up existing resources created by this script
+if iotc get "dataExport/exports/$NAME" 2>/dev/null; then
+    echo "Removing old IoT Central export..."
+    iotc delete "dataExport/exports/$NAME"
+fi
+if iotc get "dataExport/destinations/$NAME" 2>/dev/null; then
+    echo "Removing old IoT Central destination..."
+    iotc delete "dataExport/destinations/$NAME"
+fi
+if kusto ".show table $TABLE" 2>/dev/null; then
+    echo "Removing old ADX table..."
+    kusto ".drop table $TABLE"
+fi
+CLEANUP=$(az ad sp list --display-name "$NAME" $(query '[0].appId'))
+if [ "$CLEANUP" != None ]; then
+    echo "Removing old service principal..."
+    az ad sp delete --id "$CLEANUP" $(silent)
+fi
+
+# Create a new service principal for connecting IoT Central to ADX
+echo "Creating service principal \"$NAME\"..."
+SP_DATA=$(az ad sp create-for-rbac --skip-assignment --name "$NAME" \
+    $(query appId tenant password))
+CLIENT=$(getval 1 "$SP_DATA")
+TENANT=$(getval 2 "$SP_DATA")
+SECRET=$(getval 3 "$SP_DATA")
+# Wait for SP to propagate
+sleep 1m
+# Add the service principal to the ADX database
+kusto ".add database $DATABASE admins ('aadapp=$CLIENT;$TENANT')"
+
+# Specify the ADX table format for the star schema
+echo "Creating ADX table \"$TABLE\"..."
+kusto << END
+.create table $TABLE (
+    Message:string,
+    EnqueuedTime:datetime,
+    Application:string,
+    Device:string,
+    Simulated:boolean,
+    Template:string,
+    Module:string,
+    Component:string,
+    Capability:string,
+    Value:dynamic
+)
+END
+kusto ".alter table $TABLE policy streamingingestion enable"
+
+# Create the IoT Central data export destination for this table
+echo "Creating IoT Central destination \"$NAME\"..."
+iotc put "dataExport/destinations/$NAME" << END
+{
+    "displayName": "Power BI ADX Destination",
+    "type": "dataexplorer@v1",
+    "clusterUrl": "$CLUSTER_URL",
+    "database": "$DATABASE",
+    "table": "$TABLE",
+    "authorization": {
+        "type": "servicePrincipal",
+        "clientId":"$CLIENT",
+        "tenantId":"$TENANT",
+        "clientSecret":"$SECRET"
+    }
+}
+END
+
+# Define a transformation corresponding to the table schema
+TRANSFORM=$(escape << END
+import "iotc" as iotc;
+iotc::uuid as \$id | . as \$in | .telemetry[] | {
+    Message: \$id,
+    EnqueuedTime: \$in.enqueuedTime,
+    Application: \$in.applicationId,
+    Device: \$in.device.id,
+    Simulated: \$in.device.simulated,
+    Template: (\$in.device.templateName // ""),
+    Module: (\$in.module // ""),
+    Component: (\$in.component // ""),
+    Capability: .name,
+    Value: .value
+}
+END
+)
+
+# Create an IoT Central telemetry export with the specified transform
+echo "Creating IoT Central export \"$NAME\"..."
+iotc put "dataExport/exports/$NAME" << END
+{
+    "displayName": "Power BI ADX Export",
+    "source": "telemetry",
+    "enabled": true,
+    "destinations": [{
+        "id": "$NAME",
+        "transform": "$TRANSFORM"
+    }]
+}
+END
+
+echo "Done."
