@@ -18,10 +18,12 @@ and running quickly with IoT Central and Power BI, or customize the script for
 your own solution, this project is a great starting point for integrating IoT
 Central with Azure Data Explorer and Power BI.
 
+![Power BI dashboard](preview.png)
+
 ## Requirements
 
-- An IoT Central application for which you have permissions to create data
-  exports.
+- An IoT Central application, with real or simulated devices, for which you have
+  permissions to configure data exports.
 - A Linux shell environment with
   [Azure CLI](https://docs.microsoft.com/en-us/cli/azure):
   - You can use
@@ -34,11 +36,15 @@ Central with Azure Data Explorer and Power BI.
 ## Instructions
 
 1. Run `az login` to authenticate to Azure CLI.
+   - API authentication requires authentication from your home tenant. After
+     logging in, you can switch to your home tenant via the following command if
+     necessary:\
+     `az login --tenant $(az account show --query homeTenantId -o tsv)`
 2. Copy the `setup` script into your environment and run it (arguments described
    [below](#arguments)).
-   - Example:
+   - Example:\
      `setup -a <your application> -c <your ADX cluster> -d <your ADX database>`
-   * If you get a "permission denied" error, you may need to run
+   - If you get a "permission denied" error, you may need to run
      `chmod +x setup` in order to give the script execution permissions.
 3. Open the `IoT Central Power BI Solution` Power BI template file, and enter
    the same ADX cluster, database, and table provided in step 2. Note that it
@@ -69,7 +75,9 @@ script:
   ingestion.
 - A service principal used to connect IoT Central with the ADX database.
 - An IoT Central data export and ADX destination with an appropriate
-  transformation for the ADX table's schema.
+  transformation for the ADX table's schema. You can learn more about IoT
+  Central Data Export
+  [here](https://docs.microsoft.com/en-us/azure/iot-central/core/howto-export-data).
 
 ## Details
 
